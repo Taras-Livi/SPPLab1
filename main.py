@@ -1,112 +1,133 @@
+import os
 import yt_dlp
 import whisper
-import pysrt
-import moviepy.editor as mp
-import numpy as np
+from google.cloud import speech, storage
+from pydub import AudioSegment
 
-# 1. Download Audio (if needed)
-def download_youtube_audio(url, output_path="audio.wav"):
+# ВАЖЛИВО! Вказати шлях до JSON-файлу з ключем Google Cloud
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "jp-ua-karaoke-subtitles-2e9b708a8ad6.json"
+
+# 🔧 Константи
+YOUTUBE_URL = "https://www.youtube.com/watch?v=WPl10ZrhCtk"
+BUCKET_NAME = "jp-to-ua-audio-sub-bucket"
+AUDIO_FILE = "audio.wav"
+
+
+# Функція для завантаження аудіо з YouTube
+def download_audio(youtube_url, output_path="audio.mp3"):
     ydl_opts = {
         'format': 'bestaudio/best',
-        'outtmpl': output_path,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+        'outtmpl': output_path
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-    return output_path
+        ydl.download([youtube_url])
+    print("✅ Аудіо завантажено")
 
-# 2. ASR (Japanese)
-def transcribe_audio(audio_file):
-    model = whisper.load_model("medium") # or "large" for better accuracy
-    result = model.transcribe(audio_file, language="ja") #specify language
-    return result["segments"]
 
-# 3. Romaji to Ukrainian Transliteration
-def transliterate_romaji_to_ukrainian(text, mapping):
-    ukrainian_text = ""
-    #Implement your transliteration logic using the mapping dictionary
-    #This is the most critical and customized part
-    #Example:
-    #For simple 1:1 transliteration
-    for char in text:
-        if char in mapping:
-            ukrainian_text += mapping[char]
-        else:
-            ukrainian_text += char #Leave non-mapped chars as is
-    return ukrainian_text
+# Конвертація в WAV (Google Speech-to-Text вимагає WAV)
+def convert_to_wav(mp3_path="audio.mp3", wav_path="audio.wav"):
+    audio = AudioSegment.from_mp3(mp3_path)
+    audio = audio.set_channels(1).set_frame_rate(16000)
+    audio.export(wav_path, format="wav")
+    print("✅ Аудіо конвертовано в WAV")
 
-# 4. Subtitle Generation (SRT format)
-def create_srt(segments, romaji_to_ukrainian_mapping, output_file="subtitles.srt"):
-    subs = pysrt.SubRipFile()
-    for i, segment in enumerate(segments):
-        start_time = segment["start"]
-        end_time = segment["end"]
-        text = segment["text"]
-        ukrainian_text = transliterate_romaji_to_ukrainian(text, romaji_to_ukrainian_mapping)
 
-        sub = pysrt.SubRipItem(
-            index=i+1,
-            start=pysrt.SubRipTime.from_seconds(start_time),
-            end=pysrt.SubRipTime.from_seconds(end_time),
-            text=ukrainian_text
-        )
-        subs.append(sub)
+# Завантаження у GCS
+def upload_to_gcs(bucket_name, source_file_name, destination_blob_name):
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
 
-    subs.save(output_file, encoding='utf-8')
-    return output_file
+    # Створюємо bucket, якщо він не існує
+    if not bucket.exists():
+        bucket.create(location="us")
+        print(f"✅ Bucket `{bucket_name}` створено!")
 
-# 5. Overlay Subtitles on Video (Karaoke highlighting)
-def overlay_subtitles(video_file, srt_file, output_file="output.mp4"):
-    video = mp.VideoFileClip(video_file)
+    blob = bucket.blob(destination_blob_name)
+    blob.upload_from_filename(source_file_name)
 
-    def generate_subtitle_clip(text, start_time, end_time):
-        #Implement the karaoke effect logic here.  This will involve splitting
-        #the text into characters/syllables, calculating the position of each
-        #element, and creating individual text clips with different colors/effects
-        #based on the timing.
-        #This is the hardest part.
-        #This simplified example just puts a plain text overlay.
+    print(f"✅ Файл {source_file_name} завантажено у gs://{bucket_name}/{destination_blob_name}")
+    return f"gs://{bucket_name}/{destination_blob_name}"
 
-        text_clip = mp.TextClip(text,
-                                fontsize=60,
-                                color='white',
-                                font='Arial',
-                                method='caption',
-                                align='center',
-                                size = video.size) #Adjust as needed
-        text_clip = text_clip.set_pos(('center','bottom')).set_duration(end_time - start_time).set_start(start_time)
-        return text_clip
 
-    subs = pysrt.open(srt_file)
+# Функція розпізнавання мови
+def transcribe_audio_gcs(gcs_uri):
+    client = speech.SpeechClient()
+    audio = speech.RecognitionAudio(uri=gcs_uri)
 
-    subtitle_clips = [generate_subtitle_clip(sub.text, sub.start.to_seconds(), sub.end.to_seconds()) for sub in subs]
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=16000,
+        language_code="ja-JP"
+    )
 
-    final_clip = mp.CompositeVideoClip([video] + subtitle_clips)
-    final_clip.write_videofile(output_file, fps=video.fps, codec='libx264')
+    operation = client.long_running_recognize(config=config, audio=audio)
+    print("🕒 Обробка аудіо, зачекайте...")
 
-#Example Usage:
+    response = operation.result(timeout=600)  # Чекаємо до 10 хвилин
+    transcript = "\n".join([result.alternatives[0].transcript for result in response.results])
+
+    return transcript.strip()
+
+
+# Транслітерація японського тексту в romaji (Whisper)
+def japanese_to_romaji(text):
+    model = whisper.load_model("small")
+    print("Text before transcribing:", text)
+    romaji_text = model.transcribe("audio.wav", language="ja")['text']
+    print("✅ Romaji:", romaji_text)
+    return romaji_text
+
+
+# Таблиця транслітерації romaji → українська
+ROMAJI_TO_UA = {
+    "ka": "ка", "ki": "кі", "ku": "ку", "ke": "ке", "ko": "ко",
+    "sa": "са", "shi": "ші", "su": "су", "se": "се", "so": "со",
+    "ta": "та", "chi": "чі", "tsu": "цу", "te": "те", "to": "то",
+    "na": "на", "ni": "ні", "nu": "ну", "ne": "не", "no": "но",
+    "ha": "ха", "hi": "хі", "fu": "фу", "he": "хе", "ho": "хо",
+    "ma": "ма", "mi": "мі", "mu": "му", "me": "ме", "mo": "мо",
+    "ya": "я", "yu": "ю", "yo": "йо",
+    "ra": "ра", "ri": "рі", "ru": "ру", "re": "ре", "ro": "ро",
+    "wa": "ва", "wo": "во", "n": "н"
+}
+
+
+# Функція транслітерації romaji → українська
+def romaji_to_ukrainian(romaji_text):
+    words = romaji_text.split()
+    ukrainian_text = [ROMAJI_TO_UA.get(word.lower(), word) for word in words]
+
+    ukrainian_result = " ".join(ukrainian_text)
+    print("✅ Транслітерація:", ukrainian_result)
+    return ukrainian_result
+
+
+# Основна функція
+def main():
+    download_audio(YOUTUBE_URL)
+    convert_to_wav()
+
+    # Завантажуємо у GCS та отримуємо URI
+    gcs_uri = upload_to_gcs(BUCKET_NAME, AUDIO_FILE, AUDIO_FILE)
+
+    # Розпізнаємо мову через GCS
+    jp_text = transcribe_audio_gcs(gcs_uri)
+
+    # Транслітерація
+    romaji_text = japanese_to_romaji(jp_text)
+    ukrainian_text = romaji_to_ukrainian(romaji_text)
+
+    # Збереження субтитрів у файл
+    with open("karaoke_subtitles.srt", "w", encoding="utf-8") as f:
+        f.write(ukrainian_text)
+
+    print("✅ Субтитри збережені в karaoke_subtitles.srt")
+
+
 if __name__ == "__main__":
-    youtube_url = "https://www.youtube.com/watch?v=WPl10ZrhCtk"  # Replace with a real URL
-    video_file = "video.mp4" #Where you save the video
-
-    romaji_to_ukrainian_mapping = {
-        "ka": "ка", "ki": "кі", "ku": "ку", "ke": "ке", "ko": "ко",
-        "sa": "са", "shi": "ші", "su": "су", "se": "се", "so": "со",
-        "ta": "та", "chi": "чі", "tsu": "цу", "te": "те", "to": "то",
-        "na": "на", "ni": "ні", "nu": "ну", "ne": "не", "no": "но",
-        "ha": "ха", "hi": "хі", "fu": "фу", "he": "хе", "ho": "хо",
-    }
-    #1. Download Video
-    download_youtube_audio(youtube_url, "audio.wav") #Download the audio, but you need to have downloaded the video first.
-
-    #2. Transcribe Audio
-    segments = transcribe_audio("audio.wav") #Now transcribe from the audio.
-    np.save("segments.npy", segments) #Save for later use
-    segments = np.load("segments.npy", allow_pickle = True).tolist() #Load to avoid repetitive transcription
-
-    #3. Create Subtitles
-    srt_file = create_srt(segments, romaji_to_ukrainian_mapping, "subtitles.srt")
-
-    #4. Overlay Subtitles
-    overlay_subtitles(video_file, srt_file, "output.mp4")
-
-    print("Done! Check output.mp4")
+    main()
