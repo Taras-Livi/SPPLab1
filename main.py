@@ -107,7 +107,7 @@ def romaji_to_ukrainian(romaji_text):
     return ukrainian_result
 
 
-# Основна функція
+# Основна функціяs
 def main():
     download_audio(YOUTUBE_URL)
     convert_to_wav()
