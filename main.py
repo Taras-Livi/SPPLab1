@@ -3,7 +3,8 @@ import yt_dlp
 import whisper
 from google.cloud import speech, storage
 from pydub import AudioSegment
-import pykakasi  # Add this import
+import pykakasi
+import re
 
 # ВАЖЛИВО! Вказати шлях до JSON-файлу з ключем Google Cloud
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "jp-ua-karaoke-subtitles-2e9b708a8ad6.json"
@@ -75,23 +76,34 @@ def transcribe_audio_gcs(gcs_uri):
     return transcript.strip()
 
 
-# Транслітерація японського тексту в romaji (використовуємо pykakasi замість Whisper)
+# Оновлена функція транслітерації японського тексту в romaji з додаванням пробілів
 def japanese_to_romaji(japanese_text):
-    # Ініціалізація kakasi конвертера
-    kakasi = pykakasi.kakasi()
-    kakasi.setMode('H', 'a')  # Hiragana to ascii
-    kakasi.setMode('K', 'a')  # Katakana to ascii
-    kakasi.setMode('J', 'a')  # Japanese to ascii
-    converter = kakasi.getConverter()
-
     print("Text before converting to romaji:", japanese_text)
-    romaji_text = converter.do(japanese_text)
-    print("✅ Romaji:", romaji_text)
+
+    # Використовуємо новий API для pykakasi
+    kks = pykakasi.kakasi()
+    result = kks.convert(japanese_text)
+
+    # Збираємо romaji з пробілами між словами
+    romaji_parts = []
+    for item in result:
+        # Використовуємо hepburn romanization
+        romaji_parts.append(item['hepburn'])
+
+    # З'єднуємо з пробілами
+    romaji_text = " ".join(romaji_parts)
+
+    # Спеціальна обробка для "engrish" (англійських слів у японській)
+    english_pattern = re.compile(r'[a-zA-Z]+')
+    romaji_text = english_pattern.sub(lambda m: m.group(0), romaji_text)
+
+    print("✅ Romaji з пробілами:", romaji_text)
     return romaji_text
 
 
-# Покращена таблиця транслітерації romaji → українська
+# Покращена таблиця транслітерації romaji → українська з підтримкою багатосимвольних комбінацій
 ROMAJI_TO_UA = {
+    # Базові японські склади
     "ka": "ка", "ki": "кі", "ku": "ку", "ke": "ке", "ko": "ко",
     "ga": "ґа", "gi": "ґі", "gu": "ґу", "ge": "ґе", "go": "ґо",
     "sa": "са", "shi": "ші", "su": "су", "se": "се", "so": "со",
@@ -106,32 +118,74 @@ ROMAJI_TO_UA = {
     "ya": "я", "yu": "ю", "yo": "йо",
     "ra": "ра", "ri": "рі", "ru": "ру", "re": "ре", "ro": "ро",
     "wa": "ва", "wo": "во", "n": "н",
+
+    # Додаткові комбінації
+    "kya": "кя", "kyu": "кю", "kyo": "кьо",
+    "gya": "ґя", "gyu": "ґю", "gyo": "ґьо",
+    "sha": "ша", "shu": "шу", "sho": "шьо",
+    "ja": "джя", "ju": "джю", "jo": "джьо",
+    "cha": "чя", "chu": "чю", "cho": "чьо",
+    "nya": "ня", "nyu": "ню", "nyo": "ньо",
+    "hya": "хя", "hyu": "хю", "hyo": "хьо",
+    "bya": "бя", "byu": "бю", "byo": "бьо",
+    "pya": "пя", "pyu": "пю", "pyo": "пьо",
+    "mya": "мя", "myu": "мю", "myo": "мьо",
+    "rya": "ря", "ryu": "рю", "ryo": "рьо",
+
+    # Подвоєні приголосні
+    "kk": "кк", "ss": "сс", "tt": "тт", "pp": "пп",
+
+    # Маленька "tsu" для подвоєних приголосних
+    "っ": "っ",
+
+    # Довгі голосні
+    "aa": "аа", "ii": "іі", "uu": "уу", "ee": "ее", "oo": "оо",
+    "ou": "оу", "ei": "ей",
+
+    # Окремі голосні
     "a": "а", "i": "і", "u": "у", "e": "е", "o": "о",
-    " ": " ", ".": ".", ",": ",", "!": "!", "?": "?"
+
+    # Розділові знаки та спеціальні символи
+    " ": " ", ".": ".", ",": ",", "!": "!", "?": "?", "-": "-",
+    "'": "'", "\"": "\"", "(": "(", ")": ")"
 }
 
 
 # Функція транслітерації romaji → українська
 def romaji_to_ukrainian(romaji_text):
-    # Покращений алгоритм конвертації
     result = ""
     i = 0
+    romaji_text = romaji_text.lower()  # Переводимо текст у нижній регістр для обробки
+
     while i < len(romaji_text):
-        # Перевіряємо спочатку двосимвольні комбінації
+        # Спершу перевіряємо тризначні комбінації (для японських приголосних з "ya", "yu", "yo")
+        if i < len(romaji_text) - 2:
+            trigraph = romaji_text[i:i + 3]
+            if trigraph in ROMAJI_TO_UA:
+                result += ROMAJI_TO_UA[trigraph]
+                i += 3
+                continue
+
+        # Потім перевіряємо двозначні комбінації
         if i < len(romaji_text) - 1:
-            digraph = romaji_text[i:i + 2].lower()
+            digraph = romaji_text[i:i + 2]
             if digraph in ROMAJI_TO_UA:
                 result += ROMAJI_TO_UA[digraph]
                 i += 2
                 continue
 
-        # Якщо не знайшли двосимвольну комбінацію, перевіряємо один символ
-        char = romaji_text[i].lower()
+        # Якщо не знайшли багатосимвольну комбінацію, перевіряємо один символ
+        char = romaji_text[i]
         if char in ROMAJI_TO_UA:
             result += ROMAJI_TO_UA[char]
         else:
-            # Якщо символ не знайдено в таблиці, залишаємо його як є
-            result += romaji_text[i]
+            # Перевірка на латинські букви (для "engrish")
+            if 'a' <= char <= 'z' or 'A' <= char <= 'Z':
+                # Якщо це латинська буква, залишаємо її як є (для англійських слів)
+                result += char
+            else:
+                # Інакше залишаємо символ як є
+                result += char
         i += 1
 
     print("✅ Транслітерація:", result)
