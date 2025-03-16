@@ -6,9 +6,12 @@ from pydub import AudioSegment
 import pykakasi
 import re
 import numpy as np
-import librosa
 import soundfile as sf
-from spleeter.separator import Separator
+import subprocess
+import torch
+import time
+import librosa
+from datetime import timedelta
 
 # ВАЖЛИВО! Вказати шлях до JSON-файлу з ключем Google Cloud
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "jp-ua-karaoke-subtitles-2e9b708a8ad6.json"
@@ -16,13 +19,15 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "jp-ua-karaoke-subtitles-2e9b708a
 # 🔧 Константи
 YOUTUBE_URL = "https://www.youtube.com/watch?v=WPl10ZrhCtk"
 BUCKET_NAME = "jp-to-ua-audio-sub-bucket"
-AUDIO_FILE = "audio.wav"
+AUDIO_FILE = "audio.mp3"
+WAV_FILE = "audio.wav"
 VOCALS_FILE = "vocals.wav"
 SAMPLE_RATE = 16000  # Sample rate for Google STT
 
 
-# Функція для завантаження аудіо з YouTube
-def download_audio(youtube_url, output_path="audio.mp3"):
+def download_audio(youtube_url, output_path=AUDIO_FILE):
+    """Download audio from YouTube video"""
+    print("⬇️ Завантаження аудіо з YouTube...")
     ydl_opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{
@@ -34,76 +39,143 @@ def download_audio(youtube_url, output_path="audio.mp3"):
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([youtube_url])
-    print("✅ Аудіо завантажено")
+    print(f"✅ Аудіо завантажено: {output_path}")
+    return output_path
 
 
-# Відокремлення вокалу від музики
-def separate_vocals(input_audio="audio.mp3", output_dir="separated"):
-    print("🎵 Відокремлення вокалу від музики...")
+def convert_to_wav(mp3_path=AUDIO_FILE, wav_path=WAV_FILE, sample_rate=SAMPLE_RATE):
+    """Convert MP3 to WAV with specific parameters"""
+    print(f"🔄 Конвертація у WAV ({sample_rate} Hz)...")
+    audio = AudioSegment.from_mp3(mp3_path)
+    audio = audio.set_channels(1).set_frame_rate(sample_rate)
+    audio.export(wav_path, format="wav")
+    print(f"✅ Аудіо конвертовано в WAV: {wav_path}")
+    return wav_path
 
-    # Створення директорії для результатів
+
+def separate_vocals_with_demucs(audio_path=WAV_FILE, output_dir="separated"):
+    """Separate vocals from music using Demucs"""
+    print("🎤 Відокремлення вокалу від музики за допомогою Demucs...")
+
+    # Make sure the output directory exists
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    # Ініціалізація розділювача Spleeter
-    separator = Separator('spleeter:2stems')
+    # Install Demucs if it's not installed
+    try:
+        import demucs
+    except ImportError:
+        print("📦 Встановлення Demucs...")
+        subprocess.run(["pip", "install", "demucs"], check=True)
 
-    # Розділення аудіо на вокал та інструментал
-    separator.separate_to_file(input_audio, output_dir)
+    # Run Demucs separation
+    # Using the latest available model (mdx_extra)
+    command = [
+        "python", "-m", "demucs.separate",
+        "-n", "mdx_extra",  # Latest model as of March 2025
+        "--two-stems", "vocals",
+        "-o", output_dir,
+        audio_path
+    ]
 
-    print("✅ Вокал відокремлено")
-    return os.path.join(output_dir, os.path.splitext(os.path.basename(input_audio))[0], "vocals.wav")
+    try:
+        subprocess.run(command, check=True)
+        print("✅ Відокремлення вокалу завершено успішно")
+
+        # Find the vocals file (Demucs creates a specific directory structure)
+        audio_name = os.path.splitext(os.path.basename(audio_path))[0]
+        vocals_path = os.path.join(output_dir, "mdx_extra", audio_name, "vocals.wav")
+
+        # Check if file exists and copy it to a known location with resampling
+        if os.path.exists(vocals_path):
+            # Load and resample to desired sample rate
+            y, sr = librosa.load(vocals_path, sr=SAMPLE_RATE)
+            sf.write(VOCALS_FILE, y, SAMPLE_RATE)
+            print(f"✅ Вокал збережено у {VOCALS_FILE}")
+            return VOCALS_FILE
+        else:
+            print(f"❌ Не вдалося знайти файл вокалу: {vocals_path}")
+            return None
+    except Exception as e:
+        print(f"❌ Помилка під час відокремлення вокалу: {e}")
+        return None
 
 
-# Покращення якості аудіо для розпізнавання
-def enhance_audio_for_stt(input_file, output_file=VOCALS_FILE, sr=SAMPLE_RATE,
-                          noise_reduce=True, normalize=True):
-    print(f"🔊 Покращення якості аудіо для розпізнавання (sample_rate={sr})...")
+def enhance_audio_quality(input_file, output_file="enhanced_vocals.wav",
+                          noise_reduction=True,
+                          compression=True,
+                          normalize=True,
+                          highpass_freq=120,
+                          lowpass_freq=7500,
+                          gain=1.0):
+    """
+    Enhance audio quality with customizable parameters
 
-    # Завантаження аудіо
-    y, _ = librosa.load(input_file, sr=sr)
+    Parameters:
+    - input_file: Input audio file path
+    - output_file: Output enhanced audio file path
+    - noise_reduction: Apply noise reduction (True/False)
+    - compression: Apply dynamic range compression (True/False)
+    - normalize: Normalize audio levels (True/False)
+    - highpass_freq: Highpass filter frequency in Hz
+    - lowpass_freq: Lowpass filter frequency in Hz
+    - gain: Audio gain multiplier (1.0 = no change)
+    """
+    print("🔊 Покращення якості аудіо...")
 
-    # Зменшення шуму (простий high-pass filter)
-    if noise_reduce:
-        # High-pass filter для видалення низькочастотного шуму
-        y_filtered = librosa.effects.preemphasis(y, coef=0.97)
-        y = y_filtered
+    # Build FFmpeg filter chain based on parameters
+    filters = []
 
-    # Нормалізація гучності
+    # Add highpass and lowpass filters
+    filters.append(f"highpass=f={highpass_freq}")
+    filters.append(f"lowpass=f={lowpass_freq}")
+
+    # Add noise reduction if requested
+    if noise_reduction:
+        filters.append("arnndn=m=./rnnoise-models/bd.rnnn")
+
+    # Add compression if requested
+    if compression:
+        # Attack time: 10ms, Release: 100ms, Threshold: -25dB, Ratio: 4:1
+        filters.append("compand=0.01:0.1:-25/-40|-10/-10|0/-7:6:0:-90:0.2")
+
+    # Add gain adjustment
+    if gain != 1.0:
+        filters.append(f"volume={gain}")
+
+    # Add normalization if requested
     if normalize:
-        y = librosa.util.normalize(y)
+        filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
 
-    # Збереження результату
-    sf.write(output_file, y, sr, 'PCM_16')
+    # Join all filters
+    filter_chain = ",".join(filters)
 
-    print(f"✅ Аудіо оптимізовано для розпізнавання: {output_file}")
-    return output_file
+    # FFmpeg command
+    command = [
+        'ffmpeg', '-y',
+        '-i', input_file,
+        '-af', filter_chain,
+        '-ar', str(SAMPLE_RATE),
+        '-ac', '1',
+        output_file
+    ]
 
-
-# Конвертація в WAV з контролем якості
-def convert_to_wav(mp3_path="audio.mp3", wav_path="audio.wav", sample_rate=SAMPLE_RATE,
-                   channels=1, bit_depth=16):
-    print(f"🔄 Конвертація в WAV: sample_rate={sample_rate}, channels={channels}, bit_depth={bit_depth}")
-
-    audio = AudioSegment.from_mp3(mp3_path)
-    audio = audio.set_channels(channels).set_frame_rate(sample_rate)
-
-    # Встановлення bit depth
-    if bit_depth == 16:
-        audio = audio.set_sample_width(2)  # 2 bytes = 16 bits
-    elif bit_depth == 24:
-        audio = audio.set_sample_width(3)  # 3 bytes = 24 bits
-
-    audio.export(wav_path, format="wav")
-    print(f"✅ Аудіо конвертовано в WAV: {wav_path}")
+    try:
+        subprocess.run(command, check=True)
+        print(f"✅ Аудіо покращено: {output_file}")
+        return output_file
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Помилка при обробці аудіо: {e}")
+        return input_file
 
 
-# Завантаження у GCS
 def upload_to_gcs(bucket_name, source_file_name, destination_blob_name):
+    """Upload file to Google Cloud Storage"""
+    print(f"☁️ Завантаження {source_file_name} у Google Cloud Storage...")
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
 
-    # Створюємо bucket, якщо він не існує
+    # Create bucket if it doesn't exist
     if not bucket.exists():
         bucket.create(location="us")
         print(f"✅ Bucket `{bucket_name}` створено!")
@@ -115,81 +187,142 @@ def upload_to_gcs(bucket_name, source_file_name, destination_blob_name):
     return f"gs://{bucket_name}/{destination_blob_name}"
 
 
-# Функція розпізнавання мови з покращеними параметрами
-def transcribe_audio_gcs(gcs_uri):
+def transcribe_audio_google(gcs_uri):
+    """Transcribe audio using Google Speech-to-Text with enhanced parameters"""
+    print("🎯 Розпізнавання мови через Google Cloud Speech-to-Text...")
     client = speech.SpeechClient()
     audio = speech.RecognitionAudio(uri=gcs_uri)
 
-    # Покращена конфігурація для розпізнавання японської пісні
+    # Enhanced configuration for Japanese song recognition
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=SAMPLE_RATE,
         language_code="ja-JP",
-        # Добавляємо важливі параметри для покращення розпізнавання
+        # Additional parameters to improve recognition
         audio_channel_count=1,
         enable_automatic_punctuation=True,
-        model="latest_long",  # Використання найновішої моделі для довгих аудіо
-        use_enhanced=True,  # Покращена обробка аудіо на стороні Google
-        # Додаткові налаштування для пісень
-        # Встановлення контексту для розпізнавання пісень
-        speech_contexts=[speech_recognition.SpeechContext(
-            phrases=["歌詞", "音楽", "歌"],  # Підказки: "lyrics", "music", "song"
-        )],
+        model="latest_long",  # Use the latest model for long audio
+        use_enhanced=True,  # Enable enhanced processing
+        # Enable word-level timestamps for better subtitles
+        enable_word_time_offsets=True,
     )
 
+    # Start long-running recognition operation
     operation = client.long_running_recognize(config=config, audio=audio)
-    print("🕒 Обробка аудіо, зачекайте...")
+    print("🕒 Обробка аудіо через Google STT, зачекайте...")
 
-    response = operation.result(timeout=600)  # Чекаємо до 10 хвилин
+    # Wait for completion with timeout
+    response = operation.result(timeout=900)  # 15 minutes timeout
 
-    # Збір всіх результатів з часовими мітками
-    results = []
-    for i, result in enumerate(response.results):
-        alternative = result.alternatives[0]
-        transcript = alternative.transcript
+    # Process results with timestamps
+    full_transcript = ""
+    words_with_timestamps = []
 
-        # Додати часові мітки якщо доступні
-        if result.result_end_time.seconds > 0 or result.result_end_time.nanos > 0:
-            end_time = result.result_end_time.seconds + result.result_end_time.nanos / 1e9
-            results.append((transcript.strip(), end_time))
-        else:
-            results.append((transcript.strip(), None))
+    for result in response.results:
+        best_alternative = result.alternatives[0]
+        full_transcript += best_alternative.transcript + " "
 
-    # Об'єднання всіх транскрипцій
-    full_transcript = "\n".join([result[0] for result in results])
+        # Extract word-level timestamps
+        for word_info in best_alternative.words:
+            word = word_info.word
+            start_time = word_info.start_time.total_seconds()
+            end_time = word_info.end_time.total_seconds()
+            words_with_timestamps.append({
+                "word": word,
+                "start_time": start_time,
+                "end_time": end_time
+            })
 
-    # Також повертаємо результати з часовими мітками для майбутнього створення субтитрів
-    return full_transcript.strip(), results
+    print("✅ Google STT розпізнавання завершено")
+    return full_transcript.strip(), words_with_timestamps
 
 
-# Функція транслітерації японського тексту в romaji з додаванням пробілів
+def transcribe_with_whisper(audio_file, language="ja"):
+    """Transcribe audio using OpenAI's Whisper model"""
+    print("🤖 Розпізнавання аудіо за допомогою Whisper...")
+
+    # Load the Whisper model (options: tiny, base, small, medium, large)
+    # Using medium for better accuracy with songs
+    model = whisper.load_model("medium")
+
+    # Run transcription with specific parameters for better song recognition
+    result = model.transcribe(
+        audio_file,
+        language=language,
+        verbose=False,
+        # Additional parameters to improve song recognition
+        initial_prompt="This is a Japanese song lyrics.",
+        word_timestamps=True,  # Get word-level timestamps
+    )
+
+    # Extract transcript and segments with timestamps
+    transcript = result["text"]
+    segments = result["segments"]
+
+    # Prepare word-level timestamps for subtitle creation
+    words_with_timestamps = []
+    for segment in segments:
+        if "words" in segment:
+            for word_data in segment["words"]:
+                words_with_timestamps.append({
+                    "word": word_data["word"],
+                    "start_time": word_data["start"],
+                    "end_time": word_data["end"]
+                })
+
+    print("✅ Whisper розпізнавання завершено")
+    return transcript, words_with_timestamps
+
+
+def combine_transcriptions(google_transcript, whisper_transcript):
+    """Combine and reconcile transcriptions from multiple sources"""
+    print("🔄 Об'єднання результатів транскрипції...")
+
+    # Simple combining approach (can be enhanced with more sophisticated alignment)
+    # For now, we'll take the longer transcript as it likely contains more information
+    if len(google_transcript) > len(whisper_transcript):
+        combined = google_transcript
+        print("ℹ️ Використовуємо результат Google STT (довший)")
+    else:
+        combined = whisper_transcript
+        print("ℹ️ Використовуємо результат Whisper (довший)")
+
+    # Here you could implement more sophisticated text alignment algorithms
+    # to merge the best parts of both transcriptions
+
+    print(f"✅ Фінальна транскрипція: {combined[:100]}...")
+    return combined
+
+
 def japanese_to_romaji(japanese_text):
-    print("Text before converting to romaji:", japanese_text)
+    """Convert Japanese text to romaji with spaces between words"""
+    print("🈁 Конвертація японського тексту в romaji...")
+    print(f"Текст для конвертації: {japanese_text[:100]}...")
 
-    # Використовуємо новий API для pykakasi
+    # Use pykakasi for conversion
     kks = pykakasi.kakasi()
     result = kks.convert(japanese_text)
 
-    # Збираємо romaji з пробілами між словами
+    # Collect romaji with spaces between words
     romaji_parts = []
     for item in result:
-        # Використовуємо hepburn romanization
+        # Use Hepburn romanization
         romaji_parts.append(item['hepburn'])
 
-    # З'єднуємо з пробілами
+    # Join with spaces
     romaji_text = " ".join(romaji_parts)
 
-    # Спеціальна обробка для "engrish" (англійських слів у японській)
+    # Special handling for "engrish" (English words in Japanese)
     english_pattern = re.compile(r'[a-zA-Z]+')
     romaji_text = english_pattern.sub(lambda m: m.group(0), romaji_text)
 
-    print("✅ Romaji з пробілами:", romaji_text)
+    print(f"✅ Romaji: {romaji_text[:100]}...")
     return romaji_text
 
 
-# Покращена таблиця транслітерації romaji → українська з підтримкою багатосимвольних комбінацій
+# Improved transliteration table from romaji to Ukrainian
 ROMAJI_TO_UA = {
-    # Базові японські склади
+    # Basic Japanese syllables
     "ka": "ка", "ki": "кі", "ku": "ку", "ke": "ке", "ko": "ко",
     "ga": "ґа", "gi": "ґі", "gu": "ґу", "ge": "ґе", "go": "ґо",
     "sa": "са", "shi": "ші", "su": "су", "se": "се", "so": "со",
@@ -205,7 +338,7 @@ ROMAJI_TO_UA = {
     "ra": "ра", "ri": "рі", "ru": "ру", "re": "ре", "ro": "ро",
     "wa": "ва", "wo": "во", "n": "н",
 
-    # Додаткові комбінації
+    # Additional combinations
     "kya": "кя", "kyu": "кю", "kyo": "кьо",
     "gya": "ґя", "gyu": "ґю", "gyo": "ґьо",
     "sha": "ша", "shu": "шу", "sho": "шьо",
@@ -218,179 +351,381 @@ ROMAJI_TO_UA = {
     "mya": "мя", "myu": "мю", "myo": "мьо",
     "rya": "ря", "ryu": "рю", "ryo": "рьо",
 
-    # Подвоєні приголосні
+    # Double consonants
     "kk": "кк", "ss": "сс", "tt": "тт", "pp": "пп",
 
-    # Маленька "tsu" для подвоєних приголосних
+    # Small "tsu" for double consonants
     "っ": "っ",
 
-    # Довгі голосні
+    # Long vowels
     "aa": "аа", "ii": "іі", "uu": "уу", "ee": "ее", "oo": "оо",
     "ou": "оу", "ei": "ей",
 
-    # Окремі голосні
+    # Single vowels
     "a": "а", "i": "і", "u": "у", "e": "е", "o": "о",
 
-    # Розділові знаки та спеціальні символи
+    # Punctuation and special characters
     " ": " ", ".": ".", ",": ",", "!": "!", "?": "?", "-": "-",
     "'": "'", "\"": "\"", "(": "(", ")": ")"
 }
 
 
-# Функція транслітерації romaji → українська
 def romaji_to_ukrainian(romaji_text):
+    """Transliterate romaji to Ukrainian using improved mapping"""
+    print("🔄 Транслітерація romaji в українську...")
+
     result = ""
     i = 0
-    romaji_text = romaji_text.lower()  # Переводимо текст у нижній регістр для обробки
+    romaji_text = romaji_text.lower()  # Convert to lowercase for processing
 
     while i < len(romaji_text):
-        # Спершу перевіряємо тризначні комбінації (для японських приголосних з "ya", "yu", "yo")
+        # First check trigraphs (for Japanese consonants with "ya", "yu", "yo")
         if i < len(romaji_text) - 2:
-            trigraph = romaji_text[i:i + 3]
+            trigraph = romaji_text[i:i+3]
             if trigraph in ROMAJI_TO_UA:
                 result += ROMAJI_TO_UA[trigraph]
                 i += 3
                 continue
 
-        # Потім перевіряємо двозначні комбінації
+        # Then check digraphs
         if i < len(romaji_text) - 1:
-            digraph = romaji_text[i:i + 2]
+            digraph = romaji_text[i:i+2]
             if digraph in ROMAJI_TO_UA:
                 result += ROMAJI_TO_UA[digraph]
                 i += 2
                 continue
 
-        # Якщо не знайшли багатосимвольну комбінацію, перевіряємо один символ
+        # If no multi-character combination found, check single character
         char = romaji_text[i]
         if char in ROMAJI_TO_UA:
             result += ROMAJI_TO_UA[char]
         else:
-            # Перевірка на латинські букви (для "engrish")
+            # Check for Latin letters (for "engrish")
             if 'a' <= char <= 'z' or 'A' <= char <= 'Z':
-                # Якщо це латинська буква, залишаємо її як є (для англійських слів)
+                # Keep Latin letters as is (for English words)
                 result += char
             else:
-                # Інакше залишаємо символ як є
+                # Otherwise keep the character as is
                 result += char
         i += 1
 
-    print("✅ Транслітерація:", result)
+    print(f"✅ Українська транслітерація: {result[:100]}...")
     return result
 
 
-# Створення SRT субтитрів із результатів з часовими мітками
-def create_srt_subtitles(timed_results, output_file="karaoke_subtitles.srt"):
-    print("📝 Створення SRT субтитрів...")
-
-    with open(output_file, "w", encoding="utf-8") as f:
-        subtitle_index = 1
-
-        for i, (text, end_time) in enumerate(timed_results):
-            if end_time is None:
-                continue
-
-            # Примітивна оцінка часу початку (можна покращити)
-            start_time = 0 if i == 0 else timed_results[i - 1][1]
-
-            # Форматування часу для SRT (HH:MM:SS,mmm)
-            def format_time(seconds):
-                hours = int(seconds // 3600)
-                minutes = int((seconds % 3600) // 60)
-                seconds = seconds % 60
-                return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}".replace(".", ",")
-
-            # Запис субтитрів
-            f.write(f"{subtitle_index}\n")
-            f.write(f"{format_time(start_time)} --> {format_time(end_time)}\n")
-            f.write(f"{text}\n\n")
-
-            subtitle_index += 1
-
-    print(f"✅ Субтитри SRT створені: {output_file}")
+def format_time_srt(seconds):
+    """Format time in SRT format (HH:MM:SS,mmm)"""
+    td = timedelta(seconds=float(seconds))
+    hours, remainder = divmod(td.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    milliseconds = td.microseconds // 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
 
-# Додаємо додатковий варіант розпізнавання за допомогою Whisper
-def transcribe_with_whisper(audio_file, language="ja"):
-    print("🔊 Розпізнавання аудіо за допомогою Whisper...")
+def create_word_groups(words_with_timestamps, group_size=3):
+    """Group words together for better subtitle readability"""
+    if not words_with_timestamps:
+        return []
 
-    # Завантаження моделі Whisper (можна вибрати різні розміри: tiny, base, small, medium, large)
-    model = whisper.load_model("medium")
+    groups = []
+    current_group = []
 
-    # Розпізнавання
-    result = model.transcribe(audio_file, language=language, verbose=False)
+    for word_info in words_with_timestamps:
+        current_group.append(word_info)
 
-    # Отримання транскрипції та сегментів з часовими мітками
-    transcript = result["text"]
-    segments = result["segments"]
+        if len(current_group) >= group_size:
+            # Calculate group start and end times
+            start_time = current_group[0]["start_time"]
+            end_time = current_group[-1]["end_time"]
 
-    # Підготовка результатів з часовими мітками для створення субтитрів
-    timed_results = [(segment["text"], segment["end"]) for segment in segments]
+            # Join words into a phrase
+            phrase = " ".join([info["word"] for info in current_group])
 
-    print("✅ Whisper розпізнавання завершено")
-    return transcript, timed_results
+            groups.append({
+                "text": phrase,
+                "start_time": start_time,
+                "end_time": end_time
+            })
+
+            current_group = []
+
+    # Add any remaining words
+    if current_group:
+        start_time = current_group[0]["start_time"]
+        end_time = current_group[-1]["end_time"]
+        phrase = " ".join([info["word"] for info in current_group])
+
+        groups.append({
+            "text": phrase,
+            "start_time": start_time,
+            "end_time": end_time
+        })
+
+    return groups
 
 
-# Основна функція
-def main():
-    # Завантаження аудіо з YouTube
-    download_audio(YOUTUBE_URL)
+def create_subtitles(japanese_text, words_with_timestamps, output_file_prefix="karaoke_subtitles"):
+    """Create subtitles in Japanese, romaji, and Ukrainian"""
+    print("📝 Створення субтитрів...")
 
-    # Відокремлення вокалу від музики
-    vocals_file = separate_vocals()
+    # Group words for better readability
+    word_groups = create_word_groups(words_with_timestamps, group_size=3)
 
-    # Покращення якості аудіо для розпізнавання
-    enhanced_vocals = enhance_audio_for_stt(vocals_file)
+    # Process each group to generate three versions of subtitles
+    japanese_subtitles = []
+    romaji_subtitles = []
+    ukrainian_subtitles = []
 
-    # Спроба розпізнавання через Google Cloud STT
-    print("\n--- Розпізнавання через Google Cloud Speech-to-Text ---")
-    gcs_uri = upload_to_gcs(BUCKET_NAME, enhanced_vocals, "vocals.wav")
-    jp_text_google, timed_results_google = transcribe_audio_gcs(gcs_uri)
+    for i, group in enumerate(word_groups):
+        # Get the Japanese text
+        jp_text = group["text"]
 
-    # Альтернативне розпізнавання через Whisper
-    print("\n--- Розпізнавання через OpenAI Whisper ---")
-    jp_text_whisper, timed_results_whisper = transcribe_with_whisper(enhanced_vocals)
+        # Convert to romaji
+        romaji_text = japanese_to_romaji(jp_text)
 
-    # Порівняння результатів
-    print("\n--- Порівняння результатів розпізнавання ---")
-    print("Google STT довжина тексту:", len(jp_text_google))
-    print("Whisper довжина тексту:", len(jp_text_whisper))
+        # Convert to Ukrainian
+        ukrainian_text = romaji_to_ukrainian(romaji_text)
 
-    # Вибір кращого результату (простий підхід - вибрати довший результат)
-    if len(jp_text_whisper) > len(jp_text_google) * 1.2:  # Якщо Whisper видав на 20% більше тексту
-        print("✅ Вибрано результат Whisper як більш повний")
-        jp_text = jp_text_whisper
-        timed_results = timed_results_whisper
-    else:
-        print("✅ Вибрано результат Google STT")
-        jp_text = jp_text_google
-        timed_results = timed_results_google
+        # Format for SRT
+        subtitle_entry = {
+            "index": i + 1,
+            "start": format_time_srt(group["start_time"]),
+            "end": format_time_srt(group["end_time"]),
+            "text": jp_text
+        }
+        japanese_subtitles.append(subtitle_entry)
 
-    print("\nJapanese text:", jp_text)
+        # Same timing for romaji
+        romaji_entry = subtitle_entry.copy()
+        romaji_entry["text"] = romaji_text
+        romaji_subtitles.append(romaji_entry)
 
-    # Транслітерація
-    romaji_text = japanese_to_romaji(jp_text)
-    ukrainian_text = romaji_to_ukrainian(romaji_text)
+        # Same timing for Ukrainian
+        ukrainian_entry = subtitle_entry.copy()
+        ukrainian_entry["text"] = ukrainian_text
+        ukrainian_subtitles.append(ukrainian_entry)
 
-    # Створення субтитрів з часовими мітками
-    # Оновлюємо результати з транслітерацією
-    ukrainian_timed_results = [(romaji_to_ukrainian(japanese_to_romaji(text)), time)
-                               for text, time in timed_results]
+    # Write SRT files
+    def write_srt(subtitles, filename):
+        with open(filename, "w", encoding="utf-8") as f:
+            for entry in subtitles:
+                f.write(f"{entry['index']}\n")
+                f.write(f"{entry['start']} --> {entry['end']}\n")
+                f.write(f"{entry['text']}\n\n")
 
-    # Створення японських субтитрів
-    create_srt_subtitles(timed_results, "japanese_subtitles.srt")
+    write_srt(japanese_subtitles, f"{output_file_prefix}_japanese.srt")
+    write_srt(romaji_subtitles, f"{output_file_prefix}_romaji.srt")
+    write_srt(ukrainian_subtitles, f"{output_file_prefix}_ukrainian.srt")
 
-    # Створення українських субтитрів
-    create_srt_subtitles(ukrainian_timed_results, "ukrainian_subtitles.srt")
+    print(f"✅ Субтитри збережено у файлах {output_file_prefix}_*.srt")
 
-    # Збереження повного тексту українською транслітерацією
-    with open("karaoke_lyrics.txt", "w", encoding="utf-8") as f:
-        f.write(ukrainian_text)
+    # Create a combined trilingual version
+    trilingual_subtitles = []
+    for i, (jp, ro, ua) in enumerate(zip(japanese_subtitles, romaji_subtitles, ukrainian_subtitles)):
+        trilingual_entry = {
+            "index": i + 1,
+            "start": jp["start"],
+            "end": jp["end"],
+            "text": f"{jp['text']}\n{ro['text']}\n{ua['text']}"
+        }
+        trilingual_subtitles.append(trilingual_entry)
 
-    print("✅ Процес завершено! Створено файли:")
-    print("- japanese_subtitles.srt - японські субтитри з часовими мітками")
-    print("- ukrainian_subtitles.srt - українські субтитри з часовими мітками")
-    print("- karaoke_lyrics.txt - повний текст в українській транслітерації")
+    write_srt(trilingual_subtitles, f"{output_file_prefix}_trilingual.srt")
+    print(f"✅ Створено тримовні субтитри: {output_file_prefix}_trilingual.srt")
+
+    return {
+        "japanese": japanese_subtitles,
+        "romaji": romaji_subtitles,
+        "ukrainian": ukrainian_subtitles,
+        "trilingual": trilingual_subtitles
+    }
+
+
+def analyze_audio_quality(audio_file):
+    """Analyze audio quality to help with troubleshooting"""
+    print("🔍 Аналіз якості аудіо...")
+
+    try:
+        # Load audio
+        y, sr = librosa.load(audio_file, sr=None)
+
+        # Calculate statistics
+        duration = librosa.get_duration(y=y, sr=sr)
+        rms = np.sqrt(np.mean(y**2))
+        db_level = 20 * np.log10(rms) if rms > 0 else -100
+
+        # Calculate signal-to-noise ratio (simple estimation)
+        noise_floor = np.mean(np.sort(np.abs(y))[:int(len(y)*0.1)]**2)
+        noise_db = 20 * np.log10(np.sqrt(noise_floor)) if noise_floor > 0 else -100
+        snr = db_level - noise_db
+
+        print(f"✅ Тривалість аудіо: {duration:.2f} сек")
+        print(f"✅ Частота дискретизації: {sr} Hz")
+        print(f"✅ Рівень гучності: {db_level:.2f} dB")
+        print(f"✅ Приблизне співвідношення сигнал/шум: {snr:.2f} dB")
+
+        return {
+            "duration": duration,
+            "sample_rate": sr,
+            "db_level": db_level,
+            "snr": snr
+        }
+    except Exception as e:
+        print(f"❌ Помилка при аналізі аудіо: {e}")
+        return None
+
+
+def main(youtube_url=YOUTUBE_URL, audio_quality_params=None):
+    """Main function with parameterized audio quality control"""
+    print("🚀 Запуск обробки японської пісні...")
+
+    start_time = time.time()
+
+    # Set default audio quality parameters if not provided
+    if audio_quality_params is None:
+        audio_quality_params = {
+            "noise_reduction": True,
+            "compression": True,
+            "normalize": True,
+            "highpass_freq": 120,
+            "lowpass_freq": 7500,
+            "gain": 1.5
+        }
+
+    # Download audio from YouTube
+    mp3_file = download_audio(youtube_url)
+
+    # Convert to WAV
+    wav_file = convert_to_wav(mp3_file)
+
+    # Separate vocals from background music
+    vocals_file = separate_vocals_with_demucs(wav_file)
+    if vocals_file is None:
+        print("⚠️ Не вдалося відокремити вокал, використання оригінального аудіо")
+        vocals_file = wav_file
+
+    # Analyze original audio quality
+    print("📊 Аналіз якості вхідного аудіо:")
+    analyze_audio_quality(vocals_file)
+
+    # Enhance audio quality with the specified parameters
+    enhanced_file = enhance_audio_quality(
+        vocals_file,
+        output_file="enhanced_vocals.wav",
+        **audio_quality_params
+    )
+
+    # Analyze enhanced audio quality
+    print("📊 Аналіз якості покращеного аудіо:")
+    analyze_audio_quality(enhanced_file)
+
+    # Upload to Google Cloud Storage
+    gcs_uri = upload_to_gcs(BUCKET_NAME, enhanced_file, "enhanced_vocals.wav")
+
+    # Transcribe with Google Speech-to-Text
+    print("\n1️⃣ Спроба розпізнавання через Google Speech-to-Text")
+    google_transcript, google_words = transcribe_audio_google(gcs_uri)
+
+    # Transcribe with Whisper
+    print("\n2️⃣ Спроба розпізнавання через OpenAI Whisper")
+    whisper_transcript, whisper_words = transcribe_with_whisper(enhanced_file)
+
+    # Combine results from both sources
+    combined_transcript = combine_transcriptions(google_transcript, whisper_transcript)
+
+    # Use the words with timestamps from the source that produced the better transcript
+    words_with_timestamps = google_words if len(google_transcript) > len(whisper_transcript) else whisper_words
+
+    # Create subtitles in Japanese, romaji, and Ukrainian
+    subtitles = create_subtitles(combined_transcript, words_with_timestamps)
+
+    # Print execution time
+    execution_time = time.time() - start_time
+    print(f"\n✅ Обробка завершена за {execution_time:.2f} секунд")
+
+    # Print summary
+    print("\n📋 Підсумок:")
+    print(f"- Транскрипція Google STT: {len(google_transcript)} символів")
+    print(f"- Транскрипція Whisper: {len(whisper_transcript)} символів")
+    print(f"- Фінальна транскрипція: {len(combined_transcript)} символів")
+    print(f"- Створено субтитри: {len(subtitles['japanese'])} фраз")
+
+    return {
+        "google_transcript": google_transcript,
+        "whisper_transcript": whisper_transcript,
+        "combined_transcript": combined_transcript,
+        "subtitles": subtitles
+    }
 
 
 if __name__ == "__main__":
-    main()
+    # Викликаємо основну функцію з параметрами якості аудіо для експериментів
+    # Ці параметри можна змінювати для покращення розпізнавання
+    results = main(
+        youtube_url=YOUTUBE_URL,
+        audio_quality_params={
+            "noise_reduction": True,    # Зменшення шуму
+            "compression": True,        # Компресія динамічного діапазону
+            "normalize": True,          # Нормалізація гучності
+            "highpass_freq": 150,       # Частота фільтра високих частот (Гц)
+            "lowpass_freq": 7000,       # Частота фільтра низьких частот (Гц)
+            "gain": 1.5                 # Підсилення аудіо (1.0 = без змін)
+        }
+    )
+
+    # Функція для експериментів з параметрами якості аудіо
+    def experiment_with_audio_quality():
+        print("🧪 Запуск експериментів з параметрами якості аудіо...")
+
+        # Базовий набір параметрів
+        base_params = {
+            "noise_reduction": True,
+            "compression": True,
+            "normalize": True,
+            "highpass_freq": 150,
+            "lowpass_freq": 7000,
+            "gain": 1.5
+        }
+
+        # Варіанти параметрів для експериментів
+        experiments = [
+            # Експеримент 1: Базові параметри
+            base_params,
+
+            # Експеримент 2: Без шумозаглушення
+            {**base_params, "noise_reduction": False},
+
+            # Експеримент 3: Різні частоти фільтрації
+            {**base_params, "highpass_freq": 100, "lowpass_freq": 8000},
+
+            # Експеримент 4: Сильніше підсилення
+            {**base_params, "gain": 2.0},
+
+            # Експеримент 5: Без компресії
+            {**base_params, "compression": False},
+        ]
+
+        # Виконання експериментів
+        for i, params in enumerate(experiments):
+            print(f"\n💡 Експеримент {i+1}:")
+            print(f"Параметри: {params}")
+
+            # Створення тимчасового файлу для експерименту
+            output_file = f"enhanced_vocals_exp{i+1}.wav"
+
+            # Покращення аудіо з поточними параметрами
+            enhanced_file = enhance_audio_quality(
+                "vocals.wav",
+                output_file=output_file,
+                **params
+            )
+
+            # Аналіз якості
+            analyze_audio_quality(enhanced_file)
+
+            # Додатковий аналіз можна додати тут
+
+        print("\n✅ Експерименти завершено")
+
+    # Відкоментуйте, щоб запустити експерименти:
+    # experiment_with_audio_quality()
