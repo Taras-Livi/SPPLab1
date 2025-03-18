@@ -17,7 +17,7 @@ from datetime import timedelta
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "jp-ua-karaoke-subtitles-2e9b708a8ad6.json"
 
 # 🔧 Константи
-YOUTUBE_URL = "https://www.youtube.com/watch?v=WPl10ZrhCtk"
+YOUTUBE_URL = "https://www.youtube.com/watch?v=yI44Sow4iwo"
 BUCKET_NAME = "jp-to-ua-audio-sub-bucket"
 AUDIO_FILE = "audio.mp3"
 WAV_FILE = "audio.wav"
@@ -28,6 +28,10 @@ SAMPLE_RATE = 16000  # Sample rate for Google STT
 def download_audio(youtube_url, output_path=AUDIO_FILE):
     """Download audio from YouTube video"""
     print("⬇️ Завантаження аудіо з YouTube...")
+
+    # Remove extension from output_path to avoid duplication
+    output_base = os.path.splitext(output_path)[0]
+
     ydl_opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{
@@ -35,12 +39,16 @@ def download_audio(youtube_url, output_path=AUDIO_FILE):
             'preferredcodec': 'mp3',
             'preferredquality': '192',
         }],
-        'outtmpl': output_path
+        'outtmpl': output_base  # Use the base name without extension
     }
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([youtube_url])
-    print(f"✅ Аудіо завантажено: {output_path}")
-    return output_path
+
+    # The actual output file will have the correct extension added by yt-dlp
+    actual_output_path = f"{output_base}.mp3"
+    print(f"✅ Аудіо завантажено: {actual_output_path}")
+    return actual_output_path
 
 
 def convert_to_wav(mp3_path=AUDIO_FILE, wav_path=WAV_FILE, sample_rate=SAMPLE_RATE):
@@ -295,19 +303,50 @@ def combine_transcriptions(google_transcript, whisper_transcript):
 
 
 def japanese_to_romaji(japanese_text):
-    """Convert Japanese text to romaji with spaces between words"""
+    """Convert Japanese text to romaji with proper handling of particles and sokuon"""
     print("🈁 Конвертація японського тексту в romaji...")
     print(f"Текст для конвертації: {japanese_text[:100]}...")
 
+    # First, let's handle the sokuon (っ) correctly
+    # We'll mark it with a special token that won't be in the text
+    marked_text = japanese_text.replace('っ', '##SOKUON##')
+
     # Use pykakasi for conversion
     kks = pykakasi.kakasi()
-    result = kks.convert(japanese_text)
+    result = kks.convert(marked_text)
 
-    # Collect romaji with spaces between words
+    # Process the results to handle special cases
     romaji_parts = []
-    for item in result:
-        # Use Hepburn romanization
-        romaji_parts.append(item['hepburn'])
+
+    for i, item in enumerate(result):
+        orig_word = item['orig']
+        romaji_word = item['hepburn']
+
+        # Handle particle は -> wa
+        if orig_word == 'は' and (i > 0 or len(result) > 1):
+            romaji_word = 'wa'
+
+        # Handle our sokuon marker
+        if '##SOKUON##' in romaji_word:
+            # Find the character after the sokuon marker
+            match = re.search(r'##SOKUON##([bcdfghjklmnpqrstvwxyz])', romaji_word)
+            if match:
+                consonant = match.group(1)
+                # Replace the marker with the doubled consonant
+                romaji_word = romaji_word.replace(f'##SOKUON##{consonant}', f'{consonant}{consonant}')
+            else:
+                # If no consonant follows, just remove the marker
+                romaji_word = romaji_word.replace('##SOKUON##', '')
+
+        # Handle long vowel mark (ー)
+        if 'ー' in orig_word:
+            # Find the vowel before the long mark
+            for j in range(len(romaji_word)):
+                if j > 0 and romaji_word[j] == '-' and romaji_word[j - 1] in 'aiueo':
+                    vowel = romaji_word[j - 1]
+                    romaji_word = romaji_word[:j] + vowel + romaji_word[j + 1:]
+
+        romaji_parts.append(romaji_word)
 
     # Join with spaces
     romaji_text = " ".join(romaji_parts)
@@ -338,6 +377,9 @@ ROMAJI_TO_UA = {
     "ra": "ра", "ri": "рі", "ru": "ру", "re": "ре", "ro": "ро",
     "wa": "ва", "wo": "во", "n": "н",
 
+    # Particle は as "wa"
+    "wa": "ва",
+
     # Additional combinations
     "kya": "кя", "kyu": "кю", "kyo": "кьо",
     "gya": "ґя", "gyu": "ґю", "gyo": "ґьо",
@@ -351,11 +393,10 @@ ROMAJI_TO_UA = {
     "mya": "мя", "myu": "мю", "myo": "мьо",
     "rya": "ря", "ryu": "рю", "ryo": "рьо",
 
-    # Double consonants
+    # Double consonants (for sokuon っ)
     "kk": "кк", "ss": "сс", "tt": "тт", "pp": "пп",
-
-    # Small "tsu" for double consonants
-    "っ": "っ",
+    "gg": "ґґ", "zz": "дзз", "dd": "дд", "bb": "бб",
+    "mm": "мм", "rr": "рр", "cch": "чч", "ssh": "шш",
 
     # Long vowels
     "aa": "аа", "ii": "іі", "uu": "уу", "ee": "ее", "oo": "оо",
@@ -379,17 +420,25 @@ def romaji_to_ukrainian(romaji_text):
     romaji_text = romaji_text.lower()  # Convert to lowercase for processing
 
     while i < len(romaji_text):
-        # First check trigraphs (for Japanese consonants with "ya", "yu", "yo")
+        # Check for special double consonants first
+        if i < len(romaji_text) - 3:
+            tetragram = romaji_text[i:i + 4]  # For cases like "cchi"
+            if tetragram in ROMAJI_TO_UA:
+                result += ROMAJI_TO_UA[tetragram]
+                i += 4
+                continue
+
+        # Then check trigraphs (like "sha", "chu", etc.)
         if i < len(romaji_text) - 2:
-            trigraph = romaji_text[i:i+3]
+            trigraph = romaji_text[i:i + 3]
             if trigraph in ROMAJI_TO_UA:
                 result += ROMAJI_TO_UA[trigraph]
                 i += 3
                 continue
 
-        # Then check digraphs
+        # Then check digraphs (including doubled consonants)
         if i < len(romaji_text) - 1:
-            digraph = romaji_text[i:i+2]
+            digraph = romaji_text[i:i + 2]
             if digraph in ROMAJI_TO_UA:
                 result += ROMAJI_TO_UA[digraph]
                 i += 2
@@ -728,4 +777,4 @@ if __name__ == "__main__":
         print("\n✅ Експерименти завершено")
 
     # Відкоментуйте, щоб запустити експерименти:
-    # experiment_with_audio_quality()
+    # experiment_with_audio_quality()f
